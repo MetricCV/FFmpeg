@@ -45,6 +45,7 @@
 #include "libavutil/thread.h"
 #include "avcodec.h"
 #include "decode.h"
+#include "hwaccel.h"
 #include "libavutil/opt.h"
 #include "me_cmp.h"
 #include "mpegvideo.h"
@@ -56,6 +57,7 @@
 #include "version.h"
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <limits.h>
 #include <float.h>
 #if CONFIG_ICONV
@@ -114,7 +116,7 @@ static int (*lockmgr_cb)(void **mutex, enum AVLockOp op) = NULL;
 
 
 volatile int ff_avcodec_locked;
-static int volatile entangled_thread_counter = 0;
+static atomic_int entangled_thread_counter = ATOMIC_VAR_INIT(0);
 static void *codec_mutex;
 static void *avformat_mutex;
 
@@ -552,6 +554,7 @@ enum AVPixelFormat avpriv_find_pix_fmt(const PixelFormatTag *tags,
     return AV_PIX_FMT_NONE;
 }
 
+#if FF_API_CODEC_GET_SET
 MAKE_ACCESSORS(AVCodecContext, codec, AVRational, pkt_timebase)
 MAKE_ACCESSORS(AVCodecContext, codec, const AVCodecDescriptor *, codec_descriptor)
 MAKE_ACCESSORS(AVCodecContext, codec, int, lowres)
@@ -567,6 +570,7 @@ int av_codec_get_max_lowres(const AVCodec *codec)
 {
     return codec->max_lowres;
 }
+#endif
 
 int avpriv_codec_get_cap_skip_frame_fill_param(const AVCodec *codec){
     return !!(codec->caps_internal & FF_CODEC_CAP_SKIP_FRAME_FILL_PARAM);
@@ -1808,13 +1812,13 @@ static int get_audio_frame_duration(enum AVCodecID id, int sr, int ch, int ba,
                 /* calc from frame_bytes, channels, and bits_per_coded_sample */
                 switch (id) {
                 case AV_CODEC_ID_PCM_DVD:
-                    if(bps<4)
+                    if(bps<4 || frame_bytes<3)
                         return 0;
-                    return 2 * (frame_bytes / ((bps * 2 / 8) * ch));
+                    return 2 * ((frame_bytes - 3) / ((bps * 2 / 8) * ch));
                 case AV_CODEC_ID_PCM_BLURAY:
-                    if(bps<4)
+                    if(bps<4 || frame_bytes<4)
                         return 0;
-                    return frame_bytes / ((FFALIGN(ch, 2) * bps) / 8);
+                    return (frame_bytes - 4) / ((FFALIGN(ch, 2) * bps) / 8);
                 case AV_CODEC_ID_S302M:
                     return 2 * (frame_bytes / ((bps + 4) / 4)) / ch;
                 }
@@ -1883,22 +1887,27 @@ int ff_match_2uint16(const uint16_t(*tab)[2], int size, int a, int b)
     return i;
 }
 
-static AVHWAccel *first_hwaccel = NULL;
-static AVHWAccel **last_hwaccel = &first_hwaccel;
+const AVCodecHWConfig *avcodec_get_hw_config(const AVCodec *codec, int index)
+{
+    int i;
+    if (!codec->hw_configs || index < 0)
+        return NULL;
+    for (i = 0; i <= index; i++)
+        if (!codec->hw_configs[i])
+            return NULL;
+    return &codec->hw_configs[index]->public;
+}
+
+#if FF_API_USER_VISIBLE_AVHWACCEL
+AVHWAccel *av_hwaccel_next(const AVHWAccel *hwaccel)
+{
+    return NULL;
+}
 
 void av_register_hwaccel(AVHWAccel *hwaccel)
 {
-    AVHWAccel **p = last_hwaccel;
-    hwaccel->next = NULL;
-    while(*p || avpriv_atomic_ptr_cas((void * volatile *)p, NULL, hwaccel))
-        p = &(*p)->next;
-    last_hwaccel = &hwaccel->next;
 }
-
-AVHWAccel *av_hwaccel_next(const AVHWAccel *hwaccel)
-{
-    return hwaccel ? hwaccel->next : first_hwaccel;
-}
+#endif
 
 int av_lockmgr_register(int (*cb)(void **mutex, enum AVLockOp op))
 {
@@ -1942,11 +1951,11 @@ int ff_lock_avcodec(AVCodecContext *log_ctx, const AVCodec *codec)
             return -1;
     }
 
-    if (avpriv_atomic_int_add_and_fetch(&entangled_thread_counter, 1) != 1) {
+    if (atomic_fetch_add(&entangled_thread_counter, 1)) {
         av_log(log_ctx, AV_LOG_ERROR,
                "Insufficient thread locking. At least %d threads are "
                "calling avcodec_open2() at the same time right now.\n",
-               entangled_thread_counter);
+               atomic_load(&entangled_thread_counter));
         if (!lockmgr_cb)
             av_log(log_ctx, AV_LOG_ERROR, "No lock manager is set, please see av_lockmgr_register()\n");
         ff_avcodec_locked = 1;
@@ -1965,7 +1974,7 @@ int ff_unlock_avcodec(const AVCodec *codec)
 
     av_assert0(ff_avcodec_locked);
     ff_avcodec_locked = 0;
-    avpriv_atomic_int_add_and_fetch(&entangled_thread_counter, -1);
+    atomic_fetch_add(&entangled_thread_counter, -1);
     if (lockmgr_cb) {
         if ((*lockmgr_cb)(&codec_mutex, AV_LOCK_RELEASE))
             return -1;
